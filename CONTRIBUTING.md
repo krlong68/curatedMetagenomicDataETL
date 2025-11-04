@@ -61,8 +61,8 @@ We actively welcome your pull requests:
 ### Initial Setup
 
 ```bash
-# Clone the repository
-git clone https://github.com/seandavi/curatedMetagenomicDataETL.git
+# Fork the repository on GitHub first, then clone your fork
+git clone https://github.com/YOUR_USERNAME/curatedMetagenomicDataETL.git
 cd curatedMetagenomicDataETL
 
 # Install dependencies
