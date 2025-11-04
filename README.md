@@ -61,4 +61,9 @@ See [CLAUDE.md](./CLAUDE.md) for detailed architecture and [table_metadata.json]
 
 ## Contributing
 
+We welcome contributions! Please see our [Contributing Guidelines](CONTRIBUTING.md) for details on how to get started.
+
+- **[CONTRIBUTING.md](CONTRIBUTING.md)** - Guidelines for contributing to the project
+- **[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)** - Our community standards and expectations
+
 This is part of the curatedMetagenomicData project providing uniformly processed metagenomic datasets to the scientific community. The data is derived from publicly available metagenomic sequencing studies processed using standardized pipelines for consistency and comparability.
