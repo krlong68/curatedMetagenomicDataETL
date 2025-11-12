@@ -10,186 +10,182 @@ import sys
 import gzip
 import shutil
 import tempfile
+import subprocess
 from pathlib import Path
 import httpx
+from tqdm import tqdm
 from google.cloud import bigquery
-from google.cloud import storage
+import duckdb
 
 # Configuration
 PROJECT_ID = "curatedmetagenomicdata"
 DATASET_ID = "curatedmetagenomicsdata"
-TABLE_ID = "sra_accessions"
+TABLE_ID = "src_sra_accessions"
 GCS_BUCKET = "cmgd-data"
-GCS_PATH = "sra_metadata/SRA_Accessions.tab.gz"
+GCS_PATH_PREFIX = "sra_metadata/chunks/SRA_Accessions"  # Will add _part001.tab.gz, etc.
 SOURCE_URL = "https://ftp.ncbi.nlm.nih.gov/sra/reports/Metadata/SRA_Accessions.tab"
-CHUNK_SIZE = 10 * 1024 * 1024  # 10MB chunks
+CHUNK_SIZE = 10 * 1024 * 1024  # 10MB chunks for streaming
+LINES_PER_CHUNK = 500000  # Split file into chunks of 500k lines each
 
 
-def download_to_local(local_path):
-    """Download file from NCBI to local filesystem with progress tracking."""
+def ncbi_to_parquet(input_tab_path, output_parquet_path):
+    """Convert NCBI SRA Accessions tab file to Parquet using DuckDB for efficiency.
+    
+    Args:
+        input_tab_path: Path to input .tab file
+        output_parquet_path: Path to output .parquet file
+    """
 
-    print(f"Downloading to local file:")
-    print(f"  From: {SOURCE_URL}")
-    print(f"  To:   {local_path}")
-    print("This may take 10-20 minutes for a 28GB file...\n")
+    print("\nConverting to Parquet using DuckDB:")
+    print(f"  From: {input_tab_path}")
+    print(f"  To:   {output_parquet_path}")
 
     try:
-        with httpx.stream("GET", SOURCE_URL, timeout=None, follow_redirects=True) as response:
-            response.raise_for_status()
+        con = duckdb.connect(database=':memory:')
+        con.execute(f"""
+            COPY (
+                SELECT *
+                FROM read_csv_auto('{input_tab_path}', delim='\t', header=True, nullstr='-')
+            ) TO '{output_parquet_path}' (FORMAT 'parquet', COMPRESSION 'snappy', file_size_bytes '128MB', FILENAME_PATTERN 'sra_accessions_{{i}}');
+        """)
+        con.close()
 
-            # Get total size
-            total_size = response.headers.get("Content-Length")
-            if total_size:
-                total_mb = int(total_size) / (1024**2)
-                print(f"File size: {total_mb:.1f} MB ({int(total_size):,} bytes)")
-            else:
-                print("File size: Unknown")
+        print("✓ Conversion to Parquet complete")
 
-            print("Downloading...")
-
-            bytes_downloaded = 0
-            chunk_num = 0
-
-            with open(local_path, "wb") as f:
-                for chunk in response.iter_bytes(chunk_size=CHUNK_SIZE):
-                    f.write(chunk)
-                    bytes_downloaded += len(chunk)
-                    chunk_num += 1
-
-                    # Progress indicator every 100MB
-                    if chunk_num % 10 == 0:
-                        mb_downloaded = bytes_downloaded / (1024**2)
-                        if total_size:
-                            percent = (bytes_downloaded / int(total_size)) * 100
-                            print(f"  Progress: {mb_downloaded:.1f} MB ({percent:.1f}%)")
-                        else:
-                            print(f"  Progress: {mb_downloaded:.1f} MB")
-
-        print(f"\n✓ Download complete: {bytes_downloaded / (1024**3):.2f} GB")
-        return bytes_downloaded
-
-    except httpx.HTTPError as e:
-        print(f"✗ HTTP Error during download: {e}")
-        sys.exit(1)
     except Exception as e:
-        print(f"✗ Error during download: {e}")
+        print(f"✗ Conversion to Parquet failed: {e}")
         sys.exit(1)
 
 
-def compress_file(input_path, output_path):
-    """Compress file with gzip."""
-
-    print(f"\nCompressing file:")
-    print(f"  From: {input_path}")
-    print(f"  To:   {output_path}")
-
+def upload_chunks_parallel(chunks_dir):
+    """Upload all compressed chunk files to GCS in parallel using gcloud CLI.
+    
+    Uses wildcard pattern to upload all chunks with a single gcloud command,
+    leveraging parallel composite uploads for maximum throughput.
+    
+    Args:
+        chunks_dir: Directory containing the compressed chunk files (*.parquet)
+    
+    Returns:
+        Wildcard GCS URI pattern for the uploaded files
+    """
+    
+    chunks_dir = Path(chunks_dir)
+    wildcard_pattern = str(chunks_dir / "*.parquet")
+    gcs_destination = f"gs://{GCS_BUCKET}/{GCS_PATH_PREFIX.rsplit('/', 1)[0]}/"
+    
+    print("\nUploading chunks to GCS (parallel):")
+    print(f"  From: {wildcard_pattern}")
+    print(f"  To:   {gcs_destination}")
+    
     try:
-        bytes_read = 0
-        bytes_written = 0
-        chunk_num = 0
-
-        with open(input_path, "rb") as f_in:
-            with gzip.open(output_path, "wb", compresslevel=6) as f_out:
-                while True:
-                    chunk = f_in.read(CHUNK_SIZE)
-                    if not chunk:
-                        break
-                    f_out.write(chunk)
-                    bytes_read += len(chunk)
-                    chunk_num += 1
-
-                    # Progress indicator every 500MB
-                    if chunk_num % 50 == 0:
-                        mb_read = bytes_read / (1024**2)
-                        print(f"  Progress: {mb_read:.1f} MB compressed")
-
-        # Get compressed size
-        bytes_written = Path(output_path).stat().st_size
-
-        print(f"\n✓ Compression complete:")
-        print(f"  Original:   {bytes_read / (1024**3):.2f} GB")
-        print(f"  Compressed: {bytes_written / (1024**3):.2f} GB")
-        print(f"  Ratio:      {100 * bytes_written / bytes_read:.1f}%")
-
-        return bytes_written
-
-    except Exception as e:
-        print(f"✗ Compression failed: {e}")
+        # Use gcloud with wildcard for parallel uploads
+        cmd = [
+            "gcloud", "storage", "cp",
+            wildcard_pattern,
+            gcs_destination,
+            "--recursive"
+        ]
+        
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        
+        # Show gcloud output
+        if result.stdout:
+            print(result.stdout)
+        
+        # Return wildcard URI pattern for BigQuery load
+        wildcard_uri = f"gs://{GCS_BUCKET}/{GCS_PATH_PREFIX}_part*.tab.gz"
+        print("\n✓ Parallel upload complete")
+        print(f"  URI pattern: {wildcard_uri}")
+        
+        return wildcard_uri
+        
+    except subprocess.CalledProcessError as e:
+        print(f"✗ gcloud upload failed: {e}")
+        if e.stderr:
+            print(f"Error output: {e.stderr}")
         sys.exit(1)
 
 
 def upload_to_gcs(local_path, gcs_uri):
-    """Upload local file to GCS."""
+    """Upload local file to GCS using gcloud CLI for faster parallel uploads."""
 
-    print(f"\nUploading to GCS:")
+    print("\nUploading to GCS (using parallel composite upload):")
     print(f"  From: {local_path}")
     print(f"  To:   {gcs_uri}")
 
     try:
-        storage_client = storage.Client(project=PROJECT_ID)
-        bucket = storage_client.bucket(GCS_BUCKET)
-        blob = bucket.blob(GCS_PATH)
-
-        # Upload with progress tracking
-        blob.upload_from_filename(local_path)
+        # Use gcloud storage cp with parallel composite uploads (much faster)
+        # This automatically splits the file into chunks and uploads them in parallel
+        subprocess.run(
+            ["gcloud", "storage", "cp", str(local_path), gcs_uri],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
 
         print(f"✓ Upload complete: {gcs_uri}")
         return gcs_uri
 
+    except subprocess.CalledProcessError as e:
+        print(f"✗ Upload to GCS failed: {e}")
+        if e.stderr:
+            print(f"  Error output: {e.stderr}")
+        sys.exit(1)
+    except FileNotFoundError:
+        print("✗ gcloud CLI not found. Please install: https://cloud.google.com/sdk/docs/install")
+        sys.exit(1)
     except Exception as e:
         print(f"✗ Upload to GCS failed: {e}")
         sys.exit(1)
 
 
-def load_to_bigquery(gcs_uri):
-    """Load the gzipped file from GCS into BigQuery."""
+def load_to_bigquery(gcs_uri_wildcard: str):
+    """Load gzipped chunk files from GCS into BigQuery using a single wildcard URI.
+
+    This issues one load job with WRITE_TRUNCATE and relies on BigQuery's
+    support for wildcard URIs to ingest all matching files.
+    """
 
     table_id = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
 
-    print(f"\nLoading to BigQuery:")
-    print(f"  From: {gcs_uri}")
-    print(f"  To:   {table_id}")
+    print("\nLoading to BigQuery:")
+    print(f"  From (wildcard): {gcs_uri_wildcard}")
+    print(f"  To:              {table_id}")
     print("This will take several minutes...\n")
 
     client = bigquery.Client(project=PROJECT_ID)
 
-    # Configure load job for gzipped TSV
     job_config = bigquery.LoadJobConfig(
         source_format=bigquery.SourceFormat.CSV,
         field_delimiter='\t',
-        autodetect=True,  # Let BigQuery infer schema
-        write_disposition='WRITE_TRUNCATE',  # Full refresh
-        skip_leading_rows=1,  # Skip header row
+        autodetect=True,
+        write_disposition='WRITE_TRUNCATE',
+        skip_leading_rows=1,
         allow_quoted_newlines=True,
         allow_jagged_rows=False,
-        compression='GZIP',  # Handle gzipped input
+        compression='GZIP',
+        null_marker='-',
     )
 
-    # Start load job
+    # One load job with wildcard
     load_job = client.load_table_from_uri(
-        gcs_uri,
+        gcs_uri_wildcard,
         table_id,
         job_config=job_config,
     )
 
-    # Wait for completion
-    print("Load job started, waiting for completion...")
     try:
-        load_job.result()  # Wait for job to complete
-
-        # Get table info
+        load_job.result()
         table = client.get_table(table_id)
-        print(f"\n✓ Load complete!")
+        print("\n✓ Load complete!")
         print(f"  Table: {table_id}")
-        print(f"  Rows: {table.num_rows:,}")
-        print(f"  Size: {table.num_bytes / (1024**3):.2f} GB")
+        print(f"  Rows:  {table.num_rows:,}")
+        print(f"  Size:  {table.num_bytes / (1024**3):.2f} GB")
         print(f"  Created: {table.created}")
-
         return table
-
     except Exception as e:
         print(f"\n✗ Load failed: {e}")
-        # Show load errors if available
         if load_job.errors:
             print("\nLoad errors:")
             for error in load_job.errors:
@@ -202,7 +198,7 @@ def verify_table():
 
     table_id = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
 
-    print(f"\nVerifying table with test query...")
+    print("\nVerifying table with test query...")
 
     client = bigquery.Client(project=PROJECT_ID)
 
@@ -234,20 +230,41 @@ def verify_table():
         print(f"✗ Verification query failed: {e}")
 
 
-def cleanup_gcs(gcs_uri, keep_file=False):
-    """Optionally clean up GCS file after load."""
+def cleanup_gcs(gcs_uris, keep_file=False):
+    """Optionally clean up GCS files after load.
+    
+    Args:
+        gcs_uris: Single URI string or list of URIs to clean up
+    """
+
+    # Handle both single file and list of files
+    if isinstance(gcs_uris, str):
+        gcs_uris = [gcs_uris]
 
     if keep_file:
-        print(f"\nKeeping GCS file for future reloads: {gcs_uri}")
-        print("  To delete manually: gcloud storage rm " + gcs_uri)
+        print(f"\nKeeping {len(gcs_uris)} GCS file(s) for future reloads")
+        for uri in gcs_uris[:3]:
+            print(f"  {uri}")
+        if len(gcs_uris) > 3:
+            print(f"  ... and {len(gcs_uris) - 3} more")
+        print("  To delete manually: gcloud storage rm gs://BUCKET/path/to/files/*")
     else:
-        print(f"\nCleaning up GCS file: {gcs_uri}")
+        print(f"\nCleaning up {len(gcs_uris)} GCS file(s)...")
         try:
-            storage_client = storage.Client(project=PROJECT_ID)
-            bucket = storage_client.bucket(GCS_BUCKET)
-            blob = bucket.blob(GCS_PATH)
-            blob.delete()
-            print("✓ GCS file deleted")
+            # Use gcloud to delete all chunk files efficiently
+            if len(gcs_uris) > 0:
+                # Extract the pattern for bulk delete
+                subprocess.run(
+                    ["gcloud", "storage", "rm"] + gcs_uris,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                print(f"✓ {len(gcs_uris)} GCS file(s) deleted")
+        except subprocess.CalledProcessError as e:
+            print(f"✗ Cleanup failed (non-critical): {e}")
+            if e.stderr:
+                print(f"  Error: {e.stderr}")
         except Exception as e:
             print(f"✗ Cleanup failed (non-critical): {e}")
 
@@ -267,11 +284,12 @@ def main():
     """Main function to orchestrate the load."""
 
     print("="*80)
-    print("Loading SRA Accessions to BigQuery")
+    print("Loading SRA Accessions to BigQuery (Chunked)")
     print("="*80)
     print(f"Source: {SOURCE_URL}")
     print(f"Target: {PROJECT_ID}.{DATASET_ID}.{TABLE_ID}")
-    print(f"Staging: gs://{GCS_BUCKET}/{GCS_PATH}")
+    print(f"Staging: gs://{GCS_BUCKET}/{GCS_PATH_PREFIX}_*.tab.gz")
+    print(f"Chunk size: {LINES_PER_CHUNK:,} lines per file")
     print("="*80)
     print()
 
@@ -280,54 +298,49 @@ def main():
     print(f"Using temp directory: {temp_dir}\n")
 
     try:
-        # Step 1: Download to local filesystem
-        print("STEP 1: Download to Local Filesystem")
-        print("-" * 80)
-        local_file = Path(temp_dir) / "SRA_Accessions.tab"
-        download_to_local(local_file)
 
-        # Step 2: Compress with gzip
-        print("\nSTEP 2: Compress with gzip")
+        # Step 0: Convert NCBI SRA Accessions tab file to Parquet
+        print("STEP 0: Convert NCBI SRA Accessions to Parquet")
         print("-" * 80)
-        compressed_file = Path(temp_dir) / "SRA_Accessions.tab.gz"
-        compress_file(local_file, compressed_file)
+        ncbi_to_parquet(SOURCE_URL, Path(temp_dir))
+        
+        exit(2)
 
-        # Step 3: Upload to GCS
-        print("\nSTEP 3: Upload to GCS")
+        # Step 2: Upload chunks to GCS (parallel)
+        print("\nSTEP 2: Upload Chunks to GCS (Parallel)")
         print("-" * 80)
-        gcs_uri = f"gs://{GCS_BUCKET}/{GCS_PATH}"
-        upload_to_gcs(compressed_file, gcs_uri)
+        wildcard_uri = upload_chunks_parallel(Path(temp_dir))
 
-        # Step 4: Load to BigQuery
-        print("\nSTEP 4: Load to BigQuery")
+        # Step 3: Load to BigQuery (single job with wildcard)
+        print("\nSTEP 3: Load to BigQuery")
         print("-" * 80)
-        table = load_to_bigquery(gcs_uri)
+        load_to_bigquery(wildcard_uri)
 
-        # Step 5: Verify
-        print("\nSTEP 5: Verify Table")
+        # Step 4: Verify
+        print("\nSTEP 4: Verify Table")
         print("-" * 80)
         verify_table()
 
-        # Step 6: Cleanup GCS (keep by default since it's compressed)
-        print("\nSTEP 6: Cleanup GCS")
+        # Step 5: Cleanup GCS (keep by default since it's compressed)
+        print("\nSTEP 5: Cleanup GCS")
         print("-" * 80)
-        cleanup_gcs(gcs_uri, keep_file=False)
+        cleanup_gcs(wildcard_uri, keep_file=True)
 
-        # Step 7: Cleanup local files (always delete)
-        print("\nSTEP 7: Cleanup Local Files")
+        # Step 6: Cleanup local files (always delete)
+        print("\nSTEP 6: Cleanup Local Files")
         print("-" * 80)
         cleanup_local_files(temp_dir)
 
         print("\n" + "="*80)
         print("Load Complete!")
         print("="*80)
-        print(f"\nYou can now query the table:")
+        print("\nYou can now query the table:")
         print(f"  SELECT * FROM `{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}` LIMIT 10")
 
     except Exception as e:
         print(f"\n✗ Pipeline failed: {e}")
         print("\nCleaning up temp files...")
-        cleanup_local_files(temp_dir)
+        ## cleanup_local_files(temp_dir)
         sys.exit(1)
 
 
